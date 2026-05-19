@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Quant AI Project
 
 이 프로젝트는 주가 데이터 수집, 거시경제 지표 분석, 뉴스 수집 및 AI 모델을 활용한 매매 시그널 생성 시스템입니다.
@@ -41,3 +42,6 @@
 - `GET /api/stock/<ticker>`: 특정 종목의 가격 데이터 조회
 - `GET /api/macro`: 최신 거시경제 지표 확인
 - `POST /api/update`: 데이터 즉시 업데이트 트리거
+=======
+# quant-ai
+>>>>>>> 2de1e47cf66b4e597550f422de1a94cb4002423c
