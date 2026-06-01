@@ -1,0 +1,17 @@
+.env
+*.pyc
+__pycache__/
+.venv/
+venv/
+cache/
+logs/
+data/*.db
+data/*.json
+!data/dashboard.json
+tmp/
+scratch/
+.idea/
+.vscode/
+*.log
+backtest_results/
+data/kis_token.json
