@@ -15,3 +15,11 @@ scratch/
 *.log
 backtest_results/
 data/kis_token.json
+
+# 개인 금융 모듈 — 금융 데이터는 절대 커밋하지 않는다
+backend/finance/data/*.db
+backend/finance/data/*.db-journal
+backend/finance/data/*.csv
+backend/finance/data/*.xlsx
+finance.db
+*_report.html

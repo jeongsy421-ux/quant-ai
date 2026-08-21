@@ -302,6 +302,15 @@ def api_download():
     return jsonify({"error": "결과 파일이 없습니다."}), 404
 
 
+# ── 개인 금융 컨설팅 모듈 (backend/finance) ──
+# /finance 대시보드와 /api/finance/* 엔드포인트를 같은 서버에 붙인다.
+try:
+    from backend.finance.api import finance_bp
+    app.register_blueprint(finance_bp)
+except Exception as _e:  # 모듈이 없거나 의존성 문제여도 백테스트 앱은 계속 동작해야 한다
+    print(f"[finance] 블루프린트 미등록: {_e}")
+
+
 if __name__ == "__main__":
     port = int(os.getenv("FLASK_PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "False").lower() == "true"

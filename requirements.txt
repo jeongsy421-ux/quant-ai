@@ -14,3 +14,4 @@ requests==2.31.0
 beautifulsoup4==4.12.2
 schedule==1.2.0
 python-dotenv==1.0.0
+openpyxl==3.1.2  # (선택) 엑셀(.xlsx) 거래내역 임포트용 — CSV만 쓸 거면 불필요
