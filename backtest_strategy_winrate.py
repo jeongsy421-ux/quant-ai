@@ -141,50 +141,91 @@ def load_from_fdr(universe, years):
     return out
 
 
-def load_from_csv_cache(dirs=("data", "backend/data")):
+def _read_snapshot(path):
+    """
+    스냅샷 CSV 1개를 OHLCV DataFrame으로 읽는다. 읽을 수 없으면 None.
+    스냅샷 날짜에 따라 날짜 컬럼명이 'Date' 또는 무명 인덱스('Unnamed: 0')로 다르다.
+    """
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception as e:
+        logging.warning(f"csv 로드 실패 {path}: {e}")
+        return None
+    if df.empty:
+        return None
+    if "Date" not in df.columns:
+        for cand in df.columns:
+            if str(cand).startswith("Unnamed") or str(cand).lower() in ("index", "date"):
+                df = df.rename(columns={cand: "Date"})
+                break
+    df = df.rename(columns={"Open": "open", "High": "high", "Low": "low",
+                            "Close": "close", "Volume": "volume", "Date": "date"})
+    if not {"date", "open", "high", "low", "close", "volume"}.issubset(df.columns):
+        return None
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])[["date", "open", "high", "low", "close", "volume"]]
+    df = df.apply(pd.to_numeric, errors="coerce") if False else df
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    df = df.drop_duplicates(subset="date", keep="last").sort_values("date").reset_index(drop=True)
+    return df if not df.empty else None
+
+
+def _snapshot_candidates(dirs, want_stock):
+    """
+    종목(또는 지수)별 스냅샷 후보를 '행수 많은 순 → 최신 순'으로 정렬해 반환.
+    가장 좋은 후보가 읽히지 않으면 다음 후보로 넘어갈 수 있게 리스트로 준다.
+    """
+    cands = {}
+    for d in dirs:
+        for path in sorted(glob.glob(os.path.join(d, "stock_*.csv"))):
+            base = os.path.basename(path)[len("stock_"):]
+            if "_" not in base:
+                continue
+            stem, snap = base.rsplit("_", 1)
+            snap = os.path.splitext(snap)[0]
+            if not snap.isdigit():
+                continue
+            code = stem.replace("_KS", "").replace("_KQ", "")
+            is_stock = code.isdigit() and len(code) == 6
+            if is_stock != want_stock:
+                continue
+            try:
+                n = sum(1 for _ in open(path, encoding="utf-8-sig")) - 1
+            except Exception:
+                continue
+            cands.setdefault(code, []).append((n, snap, path))
+    for code in cands:
+        cands[code].sort(reverse=True)
+    return cands
+
+
+def load_from_csv_cache(dirs=("data", "backend/data"), min_rows=120):
     """
     레포의 stock_*.csv 스냅샷에서 종목별로 **파일 1개만** 선택해 로드 (오프라인 폴백).
 
-    주의: 같은 종목·같은 날짜라도 스냅샷마다 수정주가 배수가 달라 값이 다르다
-    (예: 005930 2025-06-02 종가가 파일에 따라 55,931 / 56,800 / 37,470).
-    여러 스냅샷을 합치면 ±50% 짜리 가짜 봉이 생겨 승률이 완전히 왜곡되므로
-    가장 긴(= 가장 최신) 단일 파일만 쓴다.
-    """
-    best = {}   # code -> (row_count, snapshot, path)
-    for d in dirs:
-        for p in sorted(glob.glob(os.path.join(d, "stock_*.csv"))):
-            base = os.path.basename(p)[len("stock_"):]
-            stem, snap = base.rsplit("_", 1)
-            snap = os.path.splitext(snap)[0]
-            code = stem.replace("_KS", "").replace("_KQ", "")
-            if not (code.isdigit() and len(code) == 6 and snap.isdigit()):
-                continue              # 지수(^KS11)·환율(USDKRW=X)·종목명 파일 제외
-            try:
-                n = sum(1 for _ in open(p, encoding="utf-8-sig")) - 1
-            except Exception:
-                continue
-            key = (n, snap)
-            if code not in best or key > best[code][0]:
-                best[code] = (key, p)
+    주의 1: 이 스냅샷들은 파일명과 내용이 일치하지 않는 경우가 있다. 예를 들어
+    backend/data/stock_005930_KS_20260415.csv 는 삼성전자가 아니라 닛케이225
+    시계열이고(종가 배수 1.0000, 편차 0.0000), 012450/000270/035420 등에도
+    USD/KRW·DAX·S&P500 데이터가 섞여 들어가 있다. stock_data.py 가 수집 실패 시
+    다른 자산 데이터를 그대로 저장한 흔적으로 보인다.
 
+    주의 2: 같은 종목이라도 스냅샷에 따라 수정주가 기준이 달라 종가가 1~2% 다르다
+    (원주가 56,800 vs 수정주가 55,931). 이건 배수가 일정하므로 수익률 기준
+    백테스트에는 영향이 작다.
+
+    따라서 (a) 종목별로 단일 파일만 쓰고, (b) clean_universe() 에서 다른 종목·지수와
+    시계열이 동일한(= 라벨이 틀린) 종목을 탐지해 제외한다.
+    """
     out = {}
-    for code, (_, path) in best.items():
-        try:
-            df = pd.read_csv(path, encoding="utf-8-sig")
-        except Exception as e:
-            logging.warning(f"csv 로드 실패 {path}: {e}")
-            continue
-        if "Date" not in df.columns or df.empty:
-            continue
-        df = df.rename(columns={"Date": "date", "Open": "open", "High": "high",
-                                "Low": "low", "Close": "close", "Volume": "volume"})
-        if not {"open", "high", "low", "close", "volume"}.issubset(df.columns):
-            continue
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"])[["date", "open", "high", "low", "close", "volume"]]
-        df = df.drop_duplicates(subset="date", keep="last").sort_values("date").reset_index(drop=True)
-        if len(df) >= 120:
-            out[code] = df
+    for code, cands in _snapshot_candidates(dirs, want_stock=True).items():
+        for _, _, path in cands:                 # 읽히는 첫 후보를 쓴다
+            df = _read_snapshot(path)
+            if df is not None and len(df) >= min_rows:
+                df.attrs["source_file"] = os.path.relpath(path)
+                out[code] = df
+                break
     return out
 
 
@@ -246,7 +287,64 @@ def load_data(source, universe, years):
     raise SystemExit("사용 가능한 가격 데이터가 없습니다. --source fdr 로 재시도하거나 fetch_data.py 로 cache/ 를 만드세요.")
 
 
-def clean_universe(data, min_rows=120):
+def load_reference_series(dirs=("data", "backend/data"), min_rows=120):
+    """
+    지수·환율 스냅샷(stock_^KS11_*.csv, stock_USDKRW=X_*.csv 등)을 참조용으로 읽는다.
+    매매 대상이 아니라, '종목 파일에 지수 데이터가 들어있는지' 판별하는 기준으로만 쓴다.
+    """
+    out = {}
+    for code, cands in _snapshot_candidates(dirs, want_stock=False).items():
+        for _, _, path in cands:
+            df = _read_snapshot(path)
+            if df is not None and len(df) >= min_rows:
+                out[code] = df.set_index("date")["close"].astype(float)
+                break
+    return out
+
+
+def constant_ratio(s1, s2, tol=0.02, min_overlap=80):
+    """공통 날짜의 종가 배수가 거의 일정하면 같은 자산으로 본다."""
+    j = pd.concat([s1.rename("a"), s2.rename("b")], axis=1, join="inner").dropna()
+    if len(j) < min_overlap:
+        return False
+    ratio = j["b"] / j["a"]
+    med = float(ratio.median())
+    if med <= 0:
+        return False
+    return float(((ratio / med) - 1).abs().max()) <= tol
+
+
+def find_mislabeled(data, reference=None, tol=0.02, min_overlap=80):
+    """
+    라벨(종목코드)과 내용이 어긋난 종목을 찾는다.
+    - 종목 ↔ 종목 시계열이 동일하면 어느 쪽이 맞는지 알 수 없어 양쪽 모두 제외
+    - 종목 ↔ 지수/환율 시계열이 동일하면 그 종목만 제외
+      (예: stock_000270_KS_20260508.csv 에 S&P500, stock_012450_KS_20260415.csv 에 DAX)
+    """
+    codes = sorted(data)
+    series = {c: data[c].set_index("date")["close"].astype(float) for c in codes}
+    pairs, suspect = [], set()
+
+    # (1) 종목 ↔ 종목: 같은 자산이 두 코드로 들어있으면 어느 쪽이 맞는지 알 수 없다 → 양쪽 제외
+    for i, a in enumerate(codes):
+        for b in codes[i + 1:]:
+            if constant_ratio(series[a], series[b], tol, min_overlap):
+                pairs.append((a, b))
+                suspect.update((a, b))
+
+    # (2) 종목 ↔ 지수·환율: 종목 파일에 지수 데이터가 들어있는 경우 → 그 종목만 제외
+    for code, ref in (reference or {}).items():
+        for a in codes:
+            if a in suspect:
+                continue
+            if constant_ratio(series[a], ref, tol, min_overlap):
+                pairs.append((a, code))
+                suspect.add(a)
+
+    return suspect, pairs
+
+
+def clean_universe(data, reference=None, min_rows=120):
     """전 종목 정합성 검증 → 사용 가능한 종목만 남김"""
     cleaned, dropped, flagged = {}, [], []
     for code, df in data.items():
@@ -257,7 +355,13 @@ def clean_universe(data, min_rows=120):
         if notes:
             flagged.append(code)
         cleaned[code] = df
-    return cleaned, dropped, flagged
+
+    # 라벨이 틀린 종목(다른 자산 데이터가 들어있는 경우) 제외
+    suspect, pairs = find_mislabeled(cleaned, reference)
+    for code in suspect:
+        cleaned.pop(code, None)
+        logging.warning(f"[{code}] 다른 종목과 시계열 동일 → 라벨 오염 의심, 제외")
+    return cleaned, dropped, flagged, sorted(suspect), pairs
 
 
 # ==========================================
@@ -606,7 +710,8 @@ def main():
     print()
 
     raw, src_label = load_data(args.source, DEFAULT_UNIVERSE, args.years)
-    data, dropped, flagged = clean_universe(raw)
+    reference = load_reference_series()
+    data, dropped, flagged, suspect, pairs = clean_universe(raw, reference)
     if not data:
         raise SystemExit("정합성 검증을 통과한 종목이 없습니다.")
     for code in list(data):
@@ -618,6 +723,10 @@ def main():
         print(f"제외          : {len(dropped)}종목 (데이터 부족/이상) {', '.join(dropped[:8])}{'...' if len(dropped) > 8 else ''}")
     if flagged:
         print(f"정합성 보정   : {len(flagged)}종목 (상세는 {OUT_DIR}/strategy_winrate.log)")
+    if suspect:
+        print(f"라벨 오염 제외: {len(suspect)}종목 — 다른 종목과 시계열이 동일 {', '.join(suspect)}")
+        for a, b in pairs:
+            print(f"                {a} ≡ {b}")
     print()
 
     results = {}
@@ -700,6 +809,8 @@ def main():
         f"- 월 손실한도: {MONTHLY_LIMIT*100:.0f}% (도달 시 당월 신규진입 중단)",
         f"- 자본: {fmt_won(capital)}원 → 목표 {fmt_won(target)}원, 기간 {args.horizon:.0f}년",
         f"- 데이터: {src_label} / {len(data)}종목 / {all_dates.min():%Y-%m-%d} ~ {all_dates.max():%Y-%m-%d}",
+        (f"- 라벨 오염으로 제외된 종목: {', '.join(suspect)} (다른 종목과 시계열 동일)" if suspect
+         else "- 라벨 오염 검사: 통과"),
         f"- 체결 가정: 신호 익일 **시가 진입**, 갭 체결 반영, 동일봉 양방향 터치는 **손절 우선**", "",
         "## 2. 트레이드 통계", "",
         "| 룰 | 체결 | 연간 | 승률 | 승률 95% CI | 평균익 | 평균손 | 손익비 | 기대값/트레이드 | 손익분기승률 | 엣지 | p값 |",
