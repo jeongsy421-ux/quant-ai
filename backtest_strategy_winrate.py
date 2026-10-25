@@ -32,6 +32,8 @@ import sys
 import glob
 import argparse
 import logging
+import itertools
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -67,6 +69,19 @@ MAX_POS   = int(STRATEGY.get("max_positions", 3))
 MAX_HOLD  = int(STRATEGY.get("max_hold_days", 3))
 MONTHLY_LIMIT = float(RISK.get("monthly_loss_limit", -0.10))
 COST_SIDE = 0.0015                      # 편도 거래비용 (수수료+세금+슬리피지)
+
+@dataclass(frozen=True)
+class ExitParams:
+    """청산 파라미터 — 격자 탐색에서 조합별로 바꿔 끼운다."""
+    tp: float          # 익절 비율 (0.05 = +5%)
+    sl: float          # 손절 비율 (0.03 = -3%)
+    hold: int          # 최대 보유일
+
+    def label(self):
+        return f"TP+{self.tp*100:.0f}%/SL-{self.sl*100:.0f}%/{self.hold}일"
+
+
+DEFAULT_PARAMS = ExitParams(tp=TP_PCT, sl=SL_PCT, hold=MAX_HOLD)
 
 OUT_DIR = "backtest_results"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -461,11 +476,13 @@ def build_signals(data, rule_fn, min_trade_amount):
 # ==========================================
 # 4. 단일 트레이드 청산 시뮬레이션
 # ==========================================
-def simulate_trade(df, signal_idx):
+def simulate_trade(df, signal_idx, params=None):
     """
     signal_idx: 신호가 발생한 봉의 위치. 진입은 signal_idx+1 시가.
+    params: ExitParams (없으면 config.py 값)
     반환: dict(net_return, hold_days, exit_reason, ...) 또는 None(데이터 부족)
     """
+    params = params or DEFAULT_PARAMS
     entry_idx = signal_idx + 1
     if entry_idx >= len(df):
         return None
@@ -474,11 +491,11 @@ def simulate_trade(df, signal_idx):
     if entry <= 0:
         return None
 
-    tp_price = entry * (1 + TP_PCT)
-    sl_price = entry * (1 - SL_PCT)
+    tp_price = entry * (1 + params.tp)
+    sl_price = entry * (1 - params.sl)
 
     exit_price, exit_reason, hold_days = None, None, 0
-    for k in range(entry_idx, min(entry_idx + MAX_HOLD, len(df))):
+    for k in range(entry_idx, min(entry_idx + params.hold, len(df))):
         o, h, l = float(df["open"].iloc[k]), float(df["high"].iloc[k]), float(df["low"].iloc[k])
         hold_days = k - entry_idx + 1
 
@@ -499,7 +516,7 @@ def simulate_trade(df, signal_idx):
             break
 
     if exit_price is None:                            # 기간 만료 → 종가 청산
-        last = min(entry_idx + MAX_HOLD, len(df)) - 1
+        last = min(entry_idx + params.hold, len(df)) - 1
         exit_price, exit_reason = float(df["close"].iloc[last]), "기간만료"
         hold_days = last - entry_idx + 1
 
@@ -518,11 +535,21 @@ def simulate_trade(df, signal_idx):
 # ==========================================
 # 5. 포트폴리오 시뮬레이션
 # ==========================================
-def run_portfolio(data, signals, capital):
+def run_portfolio(data, signals, capital, params=None, date_from=None, date_to=None):
     """
     동시 MAX_POS 종목, 종목당 자본 1/MAX_POS, 월 손실한도 도달 시 당월 신규진입 중단.
-    반환: (trades DataFrame, equity DataFrame)
+    params: ExitParams (없으면 config.py 값)
+    date_from/date_to: 신호를 받아들일 기간 (in-sample / out-of-sample 분리용)
+    반환: (trades DataFrame, equity DataFrame, 손실한도 걸린 월 목록)
     """
+    params = params or DEFAULT_PARAMS
+    if date_from is not None:
+        signals = signals[signals["date"] >= date_from]
+    if date_to is not None:
+        signals = signals[signals["date"] < date_to]
+    if signals.empty:
+        return pd.DataFrame(), pd.DataFrame(columns=["date", "equity"]), []
+
     idx_map = {code: {d: i for i, d in enumerate(df["date"])} for code, df in data.items()}
 
     equity = float(capital)
@@ -559,7 +586,7 @@ def run_portfolio(data, signals, capital):
             si = idx_map[code].get(date)
             if si is None:
                 continue
-            t = simulate_trade(df, si)
+            t = simulate_trade(df, si, params)
             if t is None:
                 continue
 
@@ -586,7 +613,11 @@ def run_portfolio(data, signals, capital):
 # ==========================================
 # 6. 통계
 # ==========================================
-def trade_stats(tdf, edf, capital, data):
+def trade_stats(tdf, edf, capital, data=None, years=None, with_bootstrap=True):
+    """
+    years: 성과 연율화에 쓸 기간. None 이면 data 전체 구간에서 계산.
+    with_bootstrap: 기대값 p값 계산 여부 (격자 탐색에서는 비용 때문에 끈다)
+    """
     if tdf.empty:
         return None
     r = tdf["net_return"]
@@ -597,9 +628,9 @@ def trade_stats(tdf, edf, capital, data):
     payoff = avg_w / avg_l if avg_l > 0 else float("inf")
     breakeven = avg_l / (avg_w + avg_l) if (avg_w + avg_l) > 0 else float("nan")
 
-    all_dates = pd.concat([df["date"] for df in data.values()])
-    span_days = (all_dates.max() - all_dates.min()).days or 1
-    years = span_days / 365.25
+    if years is None:
+        all_dates = pd.concat([df["date"] for df in data.values()])
+        years = ((all_dates.max() - all_dates.min()).days or 1) / 365.25
 
     eq = edf["equity"]
     mdd = float(((eq - eq.cummax()) / eq.cummax()).min()) if len(eq) else 0.0
@@ -611,9 +642,12 @@ def trade_stats(tdf, edf, capital, data):
     wr_lo, wr_hi = max(0.0, win_rate - 1.96 * se), min(1.0, win_rate + 1.96 * se)
 
     # 기대값이 0보다 큰지 부트스트랩 검정 (단측 p-value)
-    rng = np.random.default_rng(0)
-    boot_means = rng.choice(r.to_numpy(), size=(10000, len(r)), replace=True).mean(axis=1)
-    p_value = float((boot_means <= 0).mean())
+    if with_bootstrap:
+        rng = np.random.default_rng(0)
+        boot_means = rng.choice(r.to_numpy(), size=(10000, len(r)), replace=True).mean(axis=1)
+        p_value = float((boot_means <= 0).mean())
+    else:
+        p_value = float("nan")
 
     return {
         "n_trades": int(len(r)),
@@ -634,6 +668,135 @@ def trade_stats(tdf, edf, capital, data):
         "years": years,
         "exit_mix": tdf["exit_reason"].value_counts().to_dict(),
     }
+
+
+# ==========================================
+# 6-2. 손절·익절폭 격자 탐색
+# ==========================================
+def split_date(data, frac):
+    """전체 거래일을 frac 지점에서 둘로 나누는 날짜"""
+    all_dates = sorted(set(pd.concat([df["date"] for df in data.values()])))
+    if not all_dates:
+        return None
+    return all_dates[max(1, min(len(all_dates) - 1, int(len(all_dates) * frac)))]
+
+
+def _span_years(signals, date_from, date_to):
+    sel = signals
+    if date_from is not None:
+        sel = sel[sel["date"] >= date_from]
+    if date_to is not None:
+        sel = sel[sel["date"] < date_to]
+    if sel.empty:
+        return 0.0
+    return max(((sel["date"].max() - sel["date"].min()).days) / 365.25, 1e-9)
+
+
+def buy_and_hold(data, date_from=None, date_to=None):
+    """
+    같은 유니버스·같은 기간의 동일가중 단순보유 수익률.
+
+    보유기간을 늘리면 기대값이 올라가는 게 전략의 엣지인지, 그냥 시장이
+    올라서인지(베타) 구분하는 기준선이다. 격자 최적값이 이 선을 못 넘으면
+    '청산 규칙을 잘 고른 것'이 아니라 '시장에 더 오래 노출된 것'이다.
+    """
+    rets, spans = [], []
+    for df in data.values():
+        sel = df
+        if date_from is not None:
+            sel = sel[sel["date"] >= date_from]
+        if date_to is not None:
+            sel = sel[sel["date"] < date_to]
+        sel = sel.dropna(subset=["close"])
+        if len(sel) < 2:
+            continue
+        first, last = float(sel["close"].iloc[0]), float(sel["close"].iloc[-1])
+        if first <= 0:
+            continue
+        rets.append(last / first - 1)
+        spans.append(((sel["date"].iloc[-1] - sel["date"].iloc[0]).days or 1) / 365.25)
+    if not rets:
+        return None
+    total = float(np.mean(rets))
+    yrs = float(np.mean(spans))
+    return {"total": total, "years": yrs,
+            "cagr": (1 + total) ** (1 / yrs) - 1 if yrs > 0 and total > -1 else float("nan"),
+            "n": len(rets)}
+
+
+def run_grid(data, signals, capital, sl_list, tp_list, hold_list, cut):
+    """
+    (손절 × 익절 × 보유일) 조합을 전수 평가한다.
+
+    조합 수가 많을수록 '우연히 좋아 보이는' 칸이 생기므로, 기간을 둘로 나눠
+    앞구간(IS)에서 고르고 뒷구간(OOS)에서 검증한 값을 함께 낸다.
+    IS 성과만 보고 파라미터를 고르면 그 숫자는 과대평가된 것이다.
+    """
+    is_years  = _span_years(signals, None, cut)
+    oos_years = _span_years(signals, cut, None)
+
+    rows = []
+    for sl, tp, hold in itertools.product(sl_list, tp_list, hold_list):
+        params = ExitParams(tp=tp, sl=sl, hold=hold)
+        rec = {"tp": tp, "sl": sl, "hold": hold, "payoff_target": tp / sl if sl else float("nan")}
+
+        for tag, d_from, d_to, yrs in (("is", None, cut, is_years), ("oos", cut, None, oos_years)):
+            tdf, edf, _ = run_portfolio(data, signals, capital, params, d_from, d_to)
+            st = trade_stats(tdf, edf, capital, years=yrs, with_bootstrap=False)
+            if st is None:
+                rec.update({f"{tag}_{k}": float("nan") for k in
+                            ("n", "win_rate", "expectancy", "edge", "cagr", "mdd")})
+                continue
+            rec.update({
+                f"{tag}_n":          st["n_trades"],
+                f"{tag}_win_rate":   st["win_rate"],
+                f"{tag}_expectancy": st["expectancy"],
+                f"{tag}_edge":       st["edge"],
+                f"{tag}_cagr":       st["cagr"],
+                f"{tag}_mdd":        st["mdd"],
+            })
+        rows.append(rec)
+
+    return pd.DataFrame(rows), is_years, oos_years
+
+
+def grid_robustness(valid, best, sl_list, tp_list):
+    """
+    선택한 칸이 '고원'인지 '뾰족한 봉우리'인지 본다.
+    이웃 칸까지 OOS 기대값이 양수면 파라미터 민감도가 낮다는 뜻이다.
+
+    격자 간격이 균일하지 않으므로(1,2,3,4,5,6,8%) 수치 거리가 아니라
+    후보 목록에서의 **순위 인접**으로 이웃을 정의한다.
+    """
+    sls, tps = sorted(sl_list), sorted(tp_list)
+    try:
+        i, j = sls.index(best["sl"]), tps.index(best["tp"])
+    except ValueError:
+        return 0, 0
+    nb_sl = {sls[k] for k in (i - 1, i, i + 1) if 0 <= k < len(sls)}
+    nb_tp = {tps[k] for k in (j - 1, j, j + 1) if 0 <= k < len(tps)}
+
+    nb = valid[(valid["hold"] == best["hold"])
+               & valid["sl"].isin(nb_sl) & valid["tp"].isin(nb_tp)]
+    nb = nb[~((nb["sl"] == best["sl"]) & (nb["tp"] == best["tp"]))]
+    if nb.empty:
+        return 0, 0
+    return int((nb["oos_expectancy"] > 0).sum()), int(len(nb))
+
+
+def grid_boundary_warnings(best, sl_list, tp_list, hold_list):
+    """최적 조합이 격자 경계에 있으면 범위를 넓혀야 한다는 신호다."""
+    out = []
+    for name, value, cands, unit in (("손절", best["sl"], sl_list, "%"),
+                                     ("익절", best["tp"], tp_list, "%"),
+                                     ("보유일", best["hold"], hold_list, "일")):
+        lo, hi = min(cands), max(cands)
+        shown = (value * 100) if unit == "%" else value
+        if value <= lo:
+            out.append(f"{name} 최적값이 후보 최소({shown:.0f}{unit})에 붙음 → 더 낮은 값까지 넓혀 볼 것")
+        elif value >= hi:
+            out.append(f"{name} 최적값이 후보 최대({shown:.0f}{unit})에 붙음 → 더 높은 값까지 넓혀 볼 것")
+    return out
 
 
 # ==========================================
@@ -702,6 +865,13 @@ def main():
     ap.add_argument("--runs", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--rules", default="momentum,surge,dip")
+    ap.add_argument("--grid", action="store_true",
+                    help="손절·익절폭 격자 탐색 실행 (in-sample 선택 → out-of-sample 검증)")
+    ap.add_argument("--grid-sl", default="1,2,3,4,5,6,8", help="손절 후보(%%)")
+    ap.add_argument("--grid-tp", default="2,3,4,5,6,8,10,12", help="익절 후보(%%)")
+    ap.add_argument("--grid-hold", default="1,2,3,5,10", help="최대 보유일 후보")
+    ap.add_argument("--split", type=float, default=0.6,
+                    help="in-sample 비율 (0.6 = 앞 60%% 로 고르고 뒤 40%% 로 검증)")
     args = ap.parse_args()
 
     capital = args.capital
@@ -757,7 +927,7 @@ def main():
         horizons = [float(h) for h in args.horizons.split(",") if h.strip()]
         multi = {h: bootstrap_goal(tdf, st, capital, target, h, args.runs, args.seed) for h in horizons}
         results[rule] = {"stats": st, "boot": bs, "multi": multi, "trades": tdf, "equity": edf,
-                         "blocked": blocked, "n_signals": len(signals)}
+                         "blocked": blocked, "n_signals": len(signals), "signals": signals}
         print(f"  신호 {len(signals):,}건 → 체결 {st['n_trades']:,}건 | 승률 {st['win_rate']*100:.1f}%")
         tdf.to_csv(os.path.join(OUT_DIR, f"trades_{rule}.csv"), index=False, encoding="utf-8-sig")
     print()
@@ -805,6 +975,94 @@ def main():
     print("* p값 = 기대값이 0 이하일 확률(부트스트랩 단측). 0.05 미만이어야 '우연 아님'으로 본다.")
     print(f"* 목표도달 = 실측 트레이드 분포 부트스트랩({args.runs:,}회) 기준 {args.horizon:.0f}년 내 {fmt_won(target)}원 도달 확률.")
     print()
+
+    # ── 손절·익절폭 격자 탐색 ──────────────────────────────
+    grid_out, bh_is, bh_oos, cut = {}, None, None, None
+    if args.grid:
+        sl_list   = [float(x) / 100 for x in args.grid_sl.split(",") if x.strip()]
+        tp_list   = [float(x) / 100 for x in args.grid_tp.split(",") if x.strip()]
+        hold_list = [int(x) for x in args.grid_hold.split(",") if x.strip()]
+        n_combo   = len(sl_list) * len(tp_list) * len(hold_list)
+        cut       = split_date(data, args.split)
+
+        print("=" * 78)
+        print(f" 손절·익절폭 격자 탐색 — 조합 {n_combo}개 × 룰 {len(results)}개")
+        print("=" * 78)
+        print(f"기간 분할: IS {all_dates.min():%Y-%m-%d} ~ {cut:%Y-%m-%d} | "
+              f"OOS {cut:%Y-%m-%d} ~ {all_dates.max():%Y-%m-%d}  (분할비율 {args.split:.0%})")
+        print("IS(앞구간)에서 고르고 OOS(뒷구간)로 검증합니다. IS 성과만 보면 과대평가입니다.")
+
+        bh_is  = buy_and_hold(data, None, cut)
+        bh_oos = buy_and_hold(data, cut, None)
+        if bh_is and bh_oos:
+            print(f"단순보유 기준선(동일가중 {bh_is['n']}종목): "
+                  f"IS {bh_is['total']*100:+.1f}% (CAGR {bh_is['cagr']*100:+.1f}%) | "
+                  f"OOS {bh_oos['total']*100:+.1f}% (CAGR {bh_oos['cagr']*100:+.1f}%)")
+            print("격자 최적값이 이 선을 못 넘으면 청산규칙의 엣지가 아니라 시장 노출(베타)입니다.")
+        print()
+
+        for rule, r in results.items():
+            gdf, is_y, oos_y = run_grid(data, r["signals"], capital,
+                                        sl_list, tp_list, hold_list, cut)
+            gdf.to_csv(os.path.join(OUT_DIR, f"grid_{rule}.csv"), index=False, encoding="utf-8-sig")
+
+            valid = gdf.dropna(subset=["is_expectancy", "oos_expectancy"])
+            valid = valid[(valid["is_n"] >= 20) & (valid["oos_n"] >= 10)]
+            if valid.empty:
+                print(f"[{rule}] 유효 조합 없음 (거래 표본 부족)\n")
+                continue
+
+            top = valid.sort_values("is_expectancy", ascending=False).head(5)
+            best = top.iloc[0]
+            nb_pos, nb_tot = grid_robustness(valid, best, sl_list, tp_list)
+            bounds = grid_boundary_warnings(best, sl_list, tp_list, hold_list)
+
+            cur = gdf[(gdf["sl"].round(4) == round(DEFAULT_PARAMS.sl, 4))
+                      & (gdf["tp"].round(4) == round(DEFAULT_PARAMS.tp, 4))
+                      & (gdf["hold"] == DEFAULT_PARAMS.hold)]
+
+            print(f"[{rule}] IS 기준 상위 5개 조합 (IS {is_y:.1f}년 / OOS {oos_y:.1f}년)")
+            hdr = (f"  {'손절':>5} {'익절':>5} {'보유':>4} | {'IS건':>5} {'IS승률':>7} {'IS기대값':>9} "
+                   f"| {'OOS건':>6} {'OOS승률':>8} {'OOS기대값':>10} {'OOS엣지':>8}")
+            print(hdr); print("  " + "-" * (len(hdr) - 2))
+            for _, g in top.iterrows():
+                print(f"  {g['sl']*100:4.0f}% {g['tp']*100:4.0f}% {int(g['hold']):3d}일 "
+                      f"| {int(g['is_n']):5d} {g['is_win_rate']*100:6.1f}% {g['is_expectancy']*100:+8.3f}% "
+                      f"| {int(g['oos_n']):6d} {g['oos_win_rate']*100:7.1f}% {g['oos_expectancy']*100:+9.3f}% "
+                      f"{g['oos_edge']*100:+7.1f}%p")
+            if not cur.empty:
+                g = cur.iloc[0]
+                print(f"  {'─'*70}")
+                print(f"  {g['sl']*100:4.0f}% {g['tp']*100:4.0f}% {int(g['hold']):3d}일 "
+                      f"| {int(g['is_n']):5d} {g['is_win_rate']*100:6.1f}% {g['is_expectancy']*100:+8.3f}% "
+                      f"| {int(g['oos_n']):6d} {g['oos_win_rate']*100:7.1f}% {g['oos_expectancy']*100:+9.3f}% "
+                      f"{g['oos_edge']*100:+7.1f}%p   ← 현재 config 설정")
+
+            oos_best = valid.sort_values("oos_expectancy", ascending=False).iloc[0]
+            print(f"  → IS 최적 {ExitParams(best['tp'], best['sl'], int(best['hold'])).label()}: "
+                  f"OOS 기대값 {best['oos_expectancy']*100:+.3f}%  "
+                  f"(이웃 {nb_tot}칸 중 {nb_pos}칸 OOS 양수)")
+            print(f"  → OOS 최적은 {ExitParams(oos_best['tp'], oos_best['sl'], int(oos_best['hold'])).label()} "
+                  f"({oos_best['oos_expectancy']*100:+.3f}%) — IS 최적과 다르면 그만큼 불안정합니다.")
+            print(f"  → OOS 기대값 양수 조합: {int((valid['oos_expectancy'] > 0).sum())}/{len(valid)}개")
+            if bh_oos:
+                print(f"  → OOS CAGR 비교: IS최적 {best['oos_cagr']*100:+.1f}% vs "
+                      f"단순보유 {bh_oos['cagr']*100:+.1f}%  "
+                      f"({'기준선 상회' if best['oos_cagr'] > bh_oos['cagr'] else '기준선 미달 — 베타일 가능성'})")
+            if best["hold"] >= 10:
+                print(f"  ⚠️ 최적 보유일이 {int(best['hold'])}일 — 단타(1~3일)가 아니라 스윙/중기 구간입니다.")
+            for w in bounds:
+                print(f"  ⚠️ {w}")
+            print()
+
+            grid_out[rule] = {"grid": gdf, "valid": valid, "top": top, "best": best,
+                              "oos_best": oos_best, "cur": cur, "nb": (nb_pos, nb_tot),
+                              "bounds": bounds, "is_years": is_y, "oos_years": oos_y,
+                              "n_combo": n_combo}
+
+        print(f"* 조합 {n_combo}개를 전수 탐색했으므로 IS 최고 칸은 우연으로도 좋아 보일 수 있습니다.")
+        print("* 판단 기준은 OOS 기대값과 '이웃 칸도 양수인지'(고원 vs 뾰족한 봉우리)입니다.")
+        print(f"* 전체 격자: {OUT_DIR}/grid_<룰>.csv\n")
 
     # ── 마크다운 리포트 ────────────────────────────────────
     lines = [
@@ -856,6 +1114,47 @@ def main():
         lines.append(f"| {rule} | " + " | ".join(str(mix.get(k, 0)) for k in
                      ["익절", "익절(갭)", "손절", "손절(갭)", "손절(동일봉)", "기간만료"]) + " |")
 
+    if grid_out:
+        g0 = next(iter(grid_out.values()))
+        lines += ["", "## 4-2. 손절·익절폭 격자 탐색", "",
+                  f"- 조합 {g0['n_combo']}개 전수 탐색 (손절 × 익절 × 최대보유일)",
+                  f"- 기간 분할: IS {all_dates.min():%Y-%m-%d} ~ {cut:%Y-%m-%d} "
+                  f"({g0['is_years']:.1f}년) / OOS {cut:%Y-%m-%d} ~ {all_dates.max():%Y-%m-%d} "
+                  f"({g0['oos_years']:.1f}년)",
+                  "- IS(앞구간)에서 고르고 OOS(뒷구간)로 검증한다. IS 성과만 보고 고르면 과대평가다."]
+        if bh_is and bh_oos:
+            lines += [f"- **단순보유 기준선**(동일가중 {bh_is['n']}종목): "
+                      f"IS {bh_is['total']*100:+.1f}% (CAGR {bh_is['cagr']*100:+.1f}%) / "
+                      f"OOS {bh_oos['total']*100:+.1f}% (CAGR {bh_oos['cagr']*100:+.1f}%). "
+                      f"이 선을 못 넘으면 청산규칙의 엣지가 아니라 시장 노출(베타)이다."]
+        lines += ["",
+                  "| 룰 | IS 최적 조합 | IS 기대값 | OOS 기대값 | OOS CAGR | 기준선 대비 | 이웃 양수 | OOS 양수 조합 | 현재 설정 OOS 기대값 |",
+                  "|---|---|---:|---:|---:|---|---:|---:|---:|"]
+        for rule, g in grid_out.items():
+            b, nb = g["best"], g["nb"]
+            cur_oos = (f"{g['cur'].iloc[0]['oos_expectancy']*100:+.3f}%"
+                       if not g["cur"].empty and pd.notna(g["cur"].iloc[0]["oos_expectancy"]) else "—")
+            vs = ("기준선 상회" if bh_oos and b["oos_cagr"] > bh_oos["cagr"] else "**미달(베타)**")
+            lines.append(
+                f"| {rule} | {ExitParams(b['tp'], b['sl'], int(b['hold'])).label()} | "
+                f"{b['is_expectancy']*100:+.3f}% | **{b['oos_expectancy']*100:+.3f}%** | "
+                f"{b['oos_cagr']*100:+.1f}% | {vs} | {nb[0]}/{nb[1]} | "
+                f"{int((g['valid']['oos_expectancy'] > 0).sum())}/{len(g['valid'])} | {cur_oos} |")
+
+        lines += ["", "### 읽는 법", "",
+                  "- **OOS 기대값**이 판단 기준이다. IS 최고 칸은 조합을 많이 시험한 결과라 우연히 좋을 수 있다.",
+                  "- **이웃 양수**는 선택한 칸 주변(손절·익절 한 칸 차이)에서도 OOS 기대값이 양수인 칸 수다. "
+                  "비율이 높으면 '고원', 낮으면 '뾰족한 봉우리'(= 파라미터를 조금만 틀려도 무너짐)다.",
+                  "- **기준선 대비**가 '미달'이면 그 조합은 청산규칙을 잘 고른 것이 아니라 시장에 더 오래 "
+                  "노출된 결과다. 그럴 바엔 그냥 보유하는 게 낫다.", ""]
+        for rule, g in grid_out.items():
+            warns = list(g["bounds"])
+            if g["best"]["hold"] >= 10:
+                warns.insert(0, f"최적 보유일이 {int(g['best']['hold'])}일 — 단타(1~3일)가 아니라 스윙/중기 구간")
+            if warns:
+                lines.append(f"- **{rule}** 주의: " + " / ".join(warns))
+        lines += ["", f"전체 격자는 `{OUT_DIR}/grid_<룰>.csv`.", ""]
+
     lines += ["", "## 5. 판정", ""]
     for rule, r in results.items():
         s, b = r["stats"], r["boot"]
@@ -887,7 +1186,13 @@ def main():
               "- 유니버스가 생존 종목 위주라면 생존 편향(survivorship bias)이 성과를 과대평가한다.",
               "- 부트스트랩은 트레이드를 독립 추출하므로 **연속 손실(losing streak)의 군집성**을 과소평가한다. 실제 MDD는 더 깊을 수 있다.",
               "- 표본이 수백 건 수준이면 승률 신뢰구간이 넓다. 신뢰구간 하단이 손익분기승률보다 낮으면 '엣지 있음'이라고 단정할 수 없다.",
-              "- 오프라인 폴백(`data/stock_*.csv`)은 스냅샷마다 수정주가 배수가 달라 종목별 단일 파일만 쓴다. 기간이 1년 남짓이라 **레짐 1개만 검증**된 셈이므로, 실제 판단은 `--source fdr --years 3` 이상으로 다시 돌려서 하라.", ""]
+              "- 오프라인 폴백(`data/stock_*.csv`)은 **파일명과 내용이 다른 파일이 섞여 있다**(005930 파일에 닛케이225 등). "
+              "종목별 단일 파일만 쓰고 라벨 오염을 탐지해 제외하지만, 애초에 신뢰할 소스가 아니다. "
+              "기간도 1년 남짓이라 **레짐 1개만 검증**된 셈이므로, 실제 판단은 `fetch_data.py` 로 `cache/` 를 만들거나 "
+              "`--source fdr --years 3` 이상으로 다시 돌려서 하라.",
+              "- 격자 탐색은 조합을 전수 시험하므로 IS 최고 칸이 우연히 좋을 수 있다. IS/OOS 분리와 이웃 칸 확인, "
+              "단순보유 기준선 비교를 함께 봐야 한다. 상승장 한 구간만으로는 '보유를 늘리면 좋아진다'는 결론이 "
+              "거의 자동으로 나오므로, 보유일 최적값이 격자 최대에 붙으면 그 자체를 의심해야 한다.", ""]
 
     path = os.path.join(OUT_DIR, "strategy_winrate_report.md")
     with open(path, "w", encoding="utf-8") as f:
