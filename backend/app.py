@@ -13,6 +13,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from flask_cors import CORS
 import FinanceDataReader as fdr
+from price_frame import safe_flatten
 
 # 외부 라이브러리 에러 로그 억제
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -719,9 +720,10 @@ def search_ticker(ticker: str):
         if df is None or df.empty:
             return jsonify({"error": f"'{ticker}' 데이터를 찾을 수 없습니다"}), 404
 
-        # 컬럼 정리
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        # 컬럼 정리 (요청한 종목의 컬럼만 선택)
+        df = safe_flatten(df, ticker, context=f"search/{ticker}")
+        if df is None or df.empty:
+            return jsonify({"error": f"'{ticker}' 데이터 정합성 확인 실패"}), 502
 
         rename_map = {
             "Adj Close": "Close", "adj close": "Close",

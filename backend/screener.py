@@ -13,6 +13,7 @@ from signal_maker import SignalMaker
 from risk_manager import RiskManager
 from macro_data import MacroDataCollector
 from config import GLOBAL_TICKERS, ETF_UNIVERSE
+from price_frame import safe_flatten
 
 logger = logging.getLogger(__name__)
 
@@ -201,9 +202,10 @@ class MarketScreener:
                 if df is None or df.empty or len(df) < 5:
                     continue
 
-                # 컬럼 정리
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
+                # 컬럼 정리 (요청한 종목의 컬럼만 선택)
+                df = safe_flatten(df, code, context=f"screener/{code}")
+                if df.empty or len(df) < 5:
+                    continue
 
                 # Close 컬럼 찾기
                 close_col = None
@@ -303,8 +305,9 @@ class MarketScreener:
                 if df is None or df.empty or len(df) < 20:
                     continue
 
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
+                df = safe_flatten(df, code, context=f"screener/{code}")
+                if df.empty or len(df) < 20:
+                    continue
 
                 # Close 컬럼
                 close_col = next((c for c in ["Close","close","Adj Close"] if c in df.columns), None)

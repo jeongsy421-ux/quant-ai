@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from price_frame import safe_flatten
 
 logger = logging.getLogger(__name__)
 DART_API_KEY = os.getenv("DART_API_KEY", "")
@@ -15,8 +16,9 @@ def get_technical(code: str) -> dict:
         df = fdr.DataReader(code, start)
         if df is None or df.empty or len(df) < 5:
             return {}
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df = safe_flatten(df, code, context=f"analysis/{code}")
+        if df.empty or len(df) < 5:
+            return {}
         close_col = next((c for c in ["Close","Adj Close"] if c in df.columns), None)
         vol_col = next((c for c in ["Volume"] if c in df.columns), None)
         if not close_col:

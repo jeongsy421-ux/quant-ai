@@ -158,6 +158,14 @@ def _read_snapshot(path):
             if str(cand).startswith("Unnamed") or str(cand).lower() in ("index", "date"):
                 df = df.rename(columns={cand: "Date"})
                 break
+    # stock_data.py 가 기록한 출처 티커가 있으면 파일명과 일치하는지 확인한다
+    if "Ticker" in df.columns:
+        recorded = {str(v).replace(".", "_") for v in df["Ticker"].dropna().unique()}
+        expected = os.path.basename(path)[len("stock_"):].rsplit("_", 1)[0]
+        if recorded and not any(r.startswith(expected.split("_")[0]) for r in recorded):
+            logging.warning(f"출처 불일치 {path}: 파일명={expected}, 기록된 Ticker={recorded}")
+            return None
+
     df = df.rename(columns={"Open": "open", "High": "high", "Low": "low",
                             "Close": "close", "Volume": "volume", "Date": "date"})
     if not {"date", "open", "high", "low", "close", "volume"}.issubset(df.columns):
