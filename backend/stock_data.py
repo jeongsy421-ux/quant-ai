@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from config import GLOBAL_TICKERS, MACRO_TICKERS, SYSTEM, ETF_UNIVERSE
+from price_frame import flatten_price_columns
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +207,7 @@ class StockDataCollector:
             df["Date"] = pd.to_datetime(df["Date"])
             df = df.set_index("Date")
             df = df[df["Close"] > 0].dropna(subset=["Close"])
-            df = self._add_technical_indicators(df)
+            df = self._add_technical_indicators(df, code)
             self._save(df, code)
             logger.info(f"[KIS 수집 완료] {code}: {len(df)}행")
             return df
@@ -221,8 +222,9 @@ class StockDataCollector:
             df = fdr.DataReader(ticker, start, end)
             if df is None or df.empty:
                 return pd.DataFrame()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            df = flatten_price_columns(df, ticker)
+            if df is None or df.empty:
+                return pd.DataFrame()
             df = df.copy()
             # Close 컬럼 통일
             for col in ["Adj Close", "adj close"]:
@@ -233,7 +235,7 @@ class StockDataCollector:
             df = df[df["Close"] > 0].dropna(subset=["Close"])
             if df.empty:
                 return pd.DataFrame()
-            df = self._add_technical_indicators(df)
+            df = self._add_technical_indicators(df, ticker)
             self._save(df, ticker)
             logger.info(f"[FDR 수집 완료] {ticker}: {len(df)}행")
             return df
@@ -258,17 +260,15 @@ class StockDataCollector:
             return {}
 
     # ── 기술적 지표 ───────────────────────────────────────
-    def _add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _add_technical_indicators(self, df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
         """RSI, MACD, 볼린저밴드 등 지표 추가"""
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        # 티커 레벨을 버리고 중복 컬럼을 위치로 추려내면 다른 자산이 섞인다.
+        # price_frame.flatten_price_columns 가 요청한 티커의 컬럼만 골라낸다.
+        df = flatten_price_columns(df, ticker)
+        if df is None or df.empty:
+            return pd.DataFrame()
 
-        df = df.loc[:, ~df.columns.duplicated()]
-
-        if isinstance(df["Close"], pd.DataFrame):
-            close = df["Close"].iloc[:, 0].copy()
-        else:
-            close = df["Close"].copy()
+        close = df["Close"].copy()
 
         # 이동평균
         for w in [5, 20, 60, 120, 200]:
@@ -347,7 +347,11 @@ class StockDataCollector:
         os.makedirs(data_dir, exist_ok=True)
         safe  = ticker.replace(".", "_")
         fname = os.path.join(data_dir, f"stock_{safe}_{datetime.now().strftime('%Y%m%d')}.csv")
-        df.to_csv(fname, encoding="utf-8-sig")
+        # 어떤 티커로 요청해 받은 데이터인지 파일 안에 남긴다.
+        # 파일명만으로는 내용을 보증할 수 없었던 사고가 있었다 (price_frame.py 참고).
+        out = df.copy()
+        out["Ticker"] = ticker
+        out.to_csv(fname, encoding="utf-8-sig")
         logger.info(f"[저장] {fname}")
 
 

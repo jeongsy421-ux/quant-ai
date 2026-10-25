@@ -10,6 +10,7 @@ from typing import List, Dict
 
 from stock_data import StockDataCollector
 from screener import UNIVERSE, UNIVERSE_MAP
+from price_frame import safe_flatten
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +58,10 @@ class Scalper:
             df = fdr.DataReader(code, start)
             if df is None or df.empty:
                 return pd.DataFrame()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df.loc[:, ~df.columns.duplicated()].copy()
+            df = safe_flatten(df, code, context=f"scalper/{ticker}")
+            if df.empty:
+                return pd.DataFrame()
+            df = df.copy()
             df = self._add_scalping_indicators(df)
             return df
         except Exception as e:

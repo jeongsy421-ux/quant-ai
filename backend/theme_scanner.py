@@ -6,6 +6,7 @@ import time
 import pandas as pd
 from datetime import datetime, timedelta
 from theme_data import THEMES, CATEGORIES, get_all_tickers, get_ticker_themes
+from price_frame import safe_flatten
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,9 @@ class ThemeScanner:
             df    = fdr.DataReader(code, start)
             if df is None or df.empty or len(df) < 2:
                 return None
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            df = safe_flatten(df, code, context=f"theme/{ticker}")
+            if df.empty or len(df) < 2:
+                return None
             close_col = next((c for c in ["Close", "Adj Close", "close"] if c in df.columns), None)
             if close_col is None:
                 return None
